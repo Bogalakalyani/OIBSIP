@@ -1,0 +1,237 @@
+import json
+import uuid
+import contextlib
+from typing import Dict, Any
+from pathlib import Path
+
+import httpx, ssl, certifi
+
+import gernas
+from gernas import Ctx
+
+from utils.gernas_telemetry import trace_lc_agent
+from inference.compliance_agent.models import AgentResponse
+from inference.compliance_agent.prompt import SYS_PROMPT, USER_PROMPT, SYS_PROMPT_TBML, USER_PROMPT_TBML
+from inference.compliance_agent.llm_client import LLMClient
+from logger import Logger
+from inference.compliance_agent.utils.utils_ import log_execution_time
+from inference.compliance_agent.utils.utils_db import read_discrepency_mapping
+from inference.utils.utils_db import update_cosmosdb
+from settings import settings
+
+logger = Logger(__file__).get_logger()
+
+# ---------------------------------------------------------------------------
+# LLM client (UNCHANGED)
+# NOTE (review F11): hostname / certificate verification is disabled here. Left as-is so
+# connectivity does not change; plan to switch to the FAB CA bundle.
+# ---------------------------------------------------------------------------
+ssl_context = ssl.create_default_context(cafile=certifi.where())
+ssl_context.check_hostname = False
+ssl_context.verify_mode = ssl.CERT_NONE
+
+
+class DeepCopyHttpxClient(httpx.Client):
+    def __deepcopy__(self, memo):
+        return self
+
+
+config_list = [{
+    "model": settings.llm_model,
+    "api_key": settings.llm_api_key,
+    "base_url": settings.llm_base_url,
+    "api_type": settings.llm_api_type,
+    "api_version": settings.llm_api_version,
+    'http_client': DeepCopyHttpxClient(verify=ssl_context)
+}]
+
+llm_client = LLMClient(config_list)
+
+
+# ---------------------------------------------------------------------------
+# GERNAS telemetry. The llm.call span lives in llm_client.invoke_gpt_4 (one span per
+# attempt); this file only passes the prompt template id so LC and TBML are distinguishable.
+# Every wrapper calls the original function with the original arguments and returns its
+# original result unchanged. The SDK never raises into the agent.
+# ---------------------------------------------------------------------------
+_read_discrepancy_mapping = gernas.trace_tool(
+    "discrepancy_mapping",
+    tool_type="api",
+    api_operation="read_discrepancy_mapping",
+    dependency="compliance_db",               # set to the real store name (e.g. cosmosdb)
+    authorization_decision="not_evaluated",
+)(read_discrepency_mapping)
+
+
+def _request_context(event):
+    """SOW §2 Identity / Execution context from the event. Raw user id is HMAC-tokenized."""
+    return gernas.request_context(
+        session_id=event.get("conversation_id"),
+        task_id=event.get("chat_id"),
+        user_id=event.get("user_id"),
+        principal_type="human",
+    )
+
+
+def _correlation_suffix() -> str:
+    c = gernas.correlation()
+    return f" | agent_run_id={c.get('agent_run_id')} trace_id={c.get('trace_id')}"
+
+
+class ComplianceAgent():
+
+    def _ok(self, payload: Dict[str, Any]) -> AgentResponse:
+        return AgentResponse(agent_run_status=True, agent_response=payload)
+
+    def _fail(self, reason: str) -> AgentResponse:
+        return AgentResponse(agent_run_status=False, agent_failure_reason=reason)
+
+    def _get_discrepancy_mapping(self):
+        mapping = {str(item['field_id']): str(item['discrepancy_value']) for item in _read_discrepancy_mapping()}
+        return mapping
+
+    def _save_json_results(self, data, file_name):
+        # NOTE (review F4): writes raw prompts / customer data to disk. Default behaviour is
+        # unchanged; set settings.compliance_save_results = False to switch it off.
+        if not getattr(settings, "compliance_save_results", True):
+            return
+        BASE_DIR = Path(__file__).resolve().parent
+        DIR = BASE_DIR / "results"
+        DIR.mkdir(exist_ok=True, parents=True)
+        file_path = DIR / f"{Path(__file__).stem}_{file_name}.json"
+        try:
+            with open(file_path, 'w', encoding="utf-8") as f:
+                json.dump(data, f, indent=4)
+        except Exception as e:
+            raise
+
+    # -----------------------------------------------------------------------
+    # Public entry point - same name, signature and return values as before.
+    # Not traced itself: it only converts exceptions into _fail(...), exactly as before.
+    # -----------------------------------------------------------------------
+    @log_execution_time
+    def run(self, conversation_id, event, res_trade_rule, key, field_id):
+        """ To generate questions for each document (LC and/or beneficiary) based on the main instructions"""
+        with contextlib.ExitStack() as stack:
+            try:
+                stack.enter_context(_request_context(event))
+            except Exception:  # telemetry must never break the agent
+                pass
+            try:
+                return self._run(conversation_id, event, res_trade_rule, key, field_id)
+            except Exception as e:
+                return self._fail(reason=f"Doc Check Agent Excption Raised. {str(e)}")
+
+    # agent.run span (SOW §2 Agent / Execution / Outcome). Exceptions propagate through it so
+    # the span records ERROR + error_category + termination_reason, then run() converts them.
+    @trace_lc_agent("lc_compliance", agent_type="worker")
+    def _run(self, conversation_id, event, res_trade_rule, key, field_id):
+        # SOW §2: no raw event / customer data in logs - only bounded identifiers.
+        try:
+            logger.info(
+                "Compliance Agent started | requested_process=%s field_id=%s%s",
+                event.get("requested_process"), field_id, _correlation_suffix(),
+            )
+            gernas.annotate({Ctx.REQUEST_TYPE: "tbml" if event.get("requested_process") == "tbml" else "lc_compliance"})
+        except Exception:
+            pass
+        try:
+            return self._check_rule(conversation_id, event, res_trade_rule, key, field_id)
+        except Exception as e:
+            logger.exception(f"Doc Check Agent Excption Raised. {e}{_correlation_suffix()}")
+            raise
+
+    # agent.step span per rule / field (SOW §10 drill-down: Run -> Step -> Span).
+    # Body below is the original compliance logic, unchanged except the traced LLM call.
+    @gernas.trace_step(
+        lambda self, conversation_id, event, res_trade_rule, key, field_id: str(field_id),
+        step_type="compliance_rule_check",
+    )
+    def _check_rule(self, conversation_id, event, res_trade_rule, key, field_id):
+        if event["requested_process"] == "tbml":
+            discrepancy_mapping = self._get_discrepancy_mapping()
+            """Explicit instruction to add Balance Amount in report """
+            explicit_field_instruction = ""
+            if field_id == '35cf288e-621c-4e95-97e7-06d8d0e98be5' and event['available_balance']:
+                # >>> PASTE YOUR ORIGINAL FULL STRING HERE (it was cut off in the screenshot) <<<
+                explicit_field_instruction = f"""4. STRICTLY Provide the 'LC available Balance' along with the 'LC total Amount' in the final response which has been used to gauge the compliance, LC available ..."""
+            discrepancy = discrepancy_mapping.get(field_id, f"[very brief one-liner summary specific to the measure] for eg. LC Expired, or Amount Exceeded by __ but for the *relevant measure* {key}")
+            #discrepancy = discrepancy_mapping.get(field_id, f"{key} mismatch between LC and presented document")
+            SYS_PROMPT_TBML_ = SYS_PROMPT_TBML.replace("{explicit_field_instruction}", explicit_field_instruction).replace("{key}", key).replace("{discrepancy}", discrepancy)
+
+            messages = [{"role": "system", "content": SYS_PROMPT_TBML_},
+                        {"role": "user", "content": USER_PROMPT_TBML.replace("{key}", key).replace("{res_trade_rule}", res_trade_rule)}]
+
+            logger.info("Compliance Agent ###step 1### || Updating Cosmos ")
+            event["CurrentAgent"] = "Trade Compliance Agent"
+            logger.info("Update to Cosmos Done !!!")
+            response, input_token, output_token = llm_client.generate(
+                payload=messages,
+                event=event,
+                prompt_template_id="lc_compliance_tbml_system",
+            )
+
+            response_input = {"input": {"event": event,
+                                        "res_trade_rule": res_trade_rule,
+                                        "key": key,
+                                        "field_id": field_id,
+                                        "sys_prompt": SYS_PROMPT_TBML_,
+                                        "user_content": messages}}
+            self._save_json_results(
+                data=response_input,
+                file_name="input"
+            )
+            self._save_json_results(
+                data={"resp": response},
+                file_name="output"
+            )
+            return self._ok(payload={"resp": response,
+                                     "input_token": input_token,
+                                     "output_token": output_token})
+
+        else:
+            discrepancy_mapping = self._get_discrepancy_mapping()
+            """Explicit instruction to add Balance Amount in report """
+            explicit_field_instruction = ""
+            if field_id == '35cf288e-621c-4e95-97e7-06d8d0e98be5' and event['available_balance']:
+                # >>> PASTE YOUR ORIGINAL FULL STRING HERE (it was cut off in the screenshot) <<<
+                explicit_field_instruction = f"""4. STRICTLY Provide the 'LC available Balance' along with the 'LC total Amount' in the final response which has been used to gauge the compliance, LC available ..."""
+            discrepancy = discrepancy_mapping.get(field_id, f"[very brief one-liner summary specific to the measure] for eg. LC Expired, or Amount Exceeded by __ but for the *relevant measure* {key}")
+            #discrepancy = discrepancy_mapping.get(field_id, f"{key} mismatch between LC and presented document")
+            SYS_PROMPT_ = SYS_PROMPT.replace("{explicit_field_instruction}", explicit_field_instruction).replace("{key}", key).replace("{discrepancy}", discrepancy)
+
+            messages = [{"role": "system", "content": SYS_PROMPT_},
+                        {"role": "user", "content": USER_PROMPT.replace("{key}", key).replace("{res_trade_rule}", res_trade_rule)}]
+
+            logger.info("Compliance Agent ###step 1### || Updating Cosmos ")
+            # update_cosmosdb(
+            #     conversation_id=event["conversation_id"],
+            #     state="",
+            #     current_agent="Trade Compliance Agent",
+            #     agent_stage_update={f"Checking Compliance for {key.replace('_',' ')}":f"Checking compliance of presentation against LC documents and UCP 600 "},
+            #     agent_interaction_update=({"agentState":"Trade Compliance Agent", "stepMessage":"Checking compliance of presentation against LC documents and trade Rules"}))
+            event["CurrentAgent"] = "Trade Compliance Agent"
+            logger.info("Update to Cosmos Done !!!")
+            response, input_token, output_token = llm_client.generate(
+                payload=messages,
+                event=event,
+                prompt_template_id="lc_compliance_system",
+            )
+
+            response_input = {"input": {"event": event,
+                                        "res_trade_rule": res_trade_rule,
+                                        "key": key,
+                                        "field_id": field_id,
+                                        "sys_prompt": SYS_PROMPT_,
+                                        "user_content": messages}}
+            self._save_json_results(
+                data=response_input,
+                file_name="input"
+            )
+            self._save_json_results(
+                data={"resp": response},
+                file_name="output"
+            )
+            return self._ok(payload={"resp": response,
+                                     "input_token": input_token,
+                                     "output_token": output_token})
